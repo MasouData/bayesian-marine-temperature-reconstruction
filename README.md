@@ -2,7 +2,7 @@
 
 **Hierarchical Bayesian modelling of marine oxygen-isotope measurements with Stan, CmdStanPy, and Databricks**
 
-This repository turns a university probabilistic-programming project into a small, reproducible research-engineering workflow. The scientific goal is simple:
+This repository presents a reproducible research-engineering workflow for Bayesian marine temperature reconstruction using oxygen-isotope measurements. The scientific goal is simple:
 
 > **Can oxygen-isotope measurements be used to reconstruct marine carbonate formation temperature, and does that relationship differ between species?**
 
