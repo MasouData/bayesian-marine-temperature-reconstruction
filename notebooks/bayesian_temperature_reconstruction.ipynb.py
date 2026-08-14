@@ -1202,3 +1202,218 @@ fig.savefig(
 print(f"Figure saved to:\n{figure_path}")
 
 plt.show()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Predictive model comparison
+# MAGIC
+# MAGIC The three modelling strategies are compared using Pareto-smoothed
+# MAGIC importance-sampling leave-one-out cross-validation (PSIS-LOO).
+# MAGIC
+# MAGIC PSIS-LOO estimates expected out-of-sample predictive accuracy by
+# MAGIC approximating the effect of leaving each observation out of model fitting.
+# MAGIC
+# MAGIC We compare:
+# MAGIC
+# MAGIC 1. Complete pooling
+# MAGIC 2. Species-specific no pooling
+# MAGIC 3. Hierarchical partial pooling
+# MAGIC
+# MAGIC Higher expected log predictive density (ELPD) indicates better predictive
+# MAGIC performance.
+# MAGIC
+# MAGIC The Pareto-\(k\) diagnostics are also inspected to ensure that the
+# MAGIC PSIS approximation is reliable.
+
+# COMMAND ----------
+
+# MAGIC %pip install -q arviz
+
+# COMMAND ----------
+
+import arviz as az
+
+print(f"ArviZ version: {az.__version__}")
+
+# COMMAND ----------
+
+# ============================================================
+# Convert CmdStanPy results to ArviZ InferenceData
+# ============================================================
+
+observed_data = {
+    "temperature": df["temperature"].to_numpy()
+}
+
+idata_complete = az.from_cmdstanpy(
+    posterior=complete_pooling_fit,
+    posterior_predictive="temperature_rep",
+    observed_data=observed_data,
+    log_likelihood={
+        "temperature": "log_lik"
+    }
+)
+
+idata_no_pooling = az.from_cmdstanpy(
+    posterior=species_fit,
+    posterior_predictive="temperature_rep",
+    observed_data=observed_data,
+    log_likelihood={
+        "temperature": "log_lik"
+    }
+)
+
+idata_partial_pooling = az.from_cmdstanpy(
+    posterior=hierarchical_fit,
+    posterior_predictive="temperature_rep",
+    observed_data=observed_data,
+    log_likelihood={
+        "temperature": "log_lik"
+    }
+)
+
+print("✓ All three models converted to ArviZ InferenceData")
+
+# COMMAND ----------
+
+# ============================================================
+# PSIS-LOO
+# ============================================================
+
+loo_complete = az.loo(
+    idata_complete,
+    var_name="temperature",
+    pointwise=True
+)
+
+loo_no_pooling = az.loo(
+    idata_no_pooling,
+    var_name="temperature",
+    pointwise=True
+)
+
+loo_partial_pooling = az.loo(
+    idata_partial_pooling,
+    var_name="temperature",
+    pointwise=True
+)
+
+print("COMPLETE POOLING")
+print(loo_complete)
+
+print("\nNO POOLING")
+print(loo_no_pooling)
+
+print("\nPARTIAL POOLING")
+print(loo_partial_pooling)
+
+# COMMAND ----------
+
+# ============================================================
+# Predictive model comparison
+# ============================================================
+
+model_comparison = az.compare(
+    {
+        "Complete pooling": loo_complete,
+        "No pooling": loo_no_pooling,
+        "Partial pooling": loo_partial_pooling,
+    }
+)
+
+display(model_comparison.round(2))
+
+# COMMAND ----------
+
+# ============================================================
+# Inspect influential PSIS-LOO observations
+# ============================================================
+
+k_no_pool = np.asarray(
+    loo_no_pooling.pareto_k
+).ravel()
+
+k_partial = np.asarray(
+    loo_partial_pooling.pareto_k
+).ravel()
+
+idx_no = int(np.argmax(k_no_pool))
+idx_partial = int(np.argmax(k_partial))
+
+print(
+    f"No pooling:     row={idx_no}, "
+    f"max Pareto k={k_no_pool[idx_no]:.3f}"
+)
+
+print(
+    f"Partial pooling: row={idx_partial}, "
+    f"max Pareto k={k_partial[idx_partial]:.3f}"
+)
+
+influential_indices = sorted(
+    set(
+        np.where(k_no_pool > 0.70)[0].tolist()
+        +
+        np.where(k_partial > 0.70)[0].tolist()
+    )
+)
+
+influential_observations = df.iloc[
+    influential_indices
+][
+    [
+        "species",
+        "location",
+        "temperature",
+        "d18_O",
+        "d18_O_w",
+        "isotope_diff",
+    ]
+].copy()
+
+influential_observations["pareto_k_no_pooling"] = [
+    k_no_pool[i] for i in influential_indices
+]
+
+influential_observations["pareto_k_partial_pooling"] = [
+    k_partial[i] for i in influential_indices
+]
+
+display(
+    influential_observations.round(3)
+)
+
+# COMMAND ----------
+
+model_summary = pd.DataFrame({
+    "Model": [
+        "Complete pooling",
+        "No pooling",
+        "Partial pooling",
+    ],
+    "ELPD-LOO": [
+        loo_complete.elpd,
+        loo_no_pooling.elpd,
+        loo_partial_pooling.elpd,
+    ],
+    "SE": [
+        loo_complete.se,
+        loo_no_pooling.se,
+        loo_partial_pooling.se,
+    ],
+    "p_LOO": [
+        loo_complete.p,
+        loo_no_pooling.p,
+        loo_partial_pooling.p,
+    ],
+    "Max Pareto k": [
+        np.max(np.asarray(loo_complete.pareto_k)),
+        np.max(k_no_pool),
+        np.max(k_partial),
+    ],
+})
+
+display(
+    model_summary.round(2)
+)
