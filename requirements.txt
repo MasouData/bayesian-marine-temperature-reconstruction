@@ -1,0 +1,7 @@
+# Python dependencies for the public analysis workflow.
+# CmdStan itself is installed separately through CmdStanPy.
+cmdstanpy>=1.3.0,<2.0
+numpy>=1.26,<3.0
+pandas>=2.1,<3.0
+matplotlib>=3.8,<4.0
+arviz>=0.20,<1.0
