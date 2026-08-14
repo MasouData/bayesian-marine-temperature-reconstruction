@@ -823,3 +823,382 @@ print(
     f"No-pooling sigma_T: "
     f"{sigma_species.mean():.3f}"
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Bayesian model 3 — Hierarchical partial pooling
+# MAGIC
+# MAGIC The no-pooling model substantially reduces residual uncertainty, indicating
+# MAGIC that the temperature–isotope relationship varies between species.
+# MAGIC
+# MAGIC However, species are represented by very different numbers of observations.
+# MAGIC Estimating every species independently can therefore produce relatively
+# MAGIC uncertain parameter estimates for sparsely sampled species.
+# MAGIC
+# MAGIC A hierarchical model provides a compromise between complete pooling and
+# MAGIC no pooling.
+# MAGIC
+# MAGIC Species-specific intercepts and slopes are modelled as:
+# MAGIC
+# MAGIC $$a_j \sim \mathcal{N}(a,\sigma_a)$$
+# MAGIC
+# MAGIC $$b_j \sim \mathcal{N}(b,\sigma_b)$$
+# MAGIC
+# MAGIC where  a and b describe the population-level relationship and
+# MAGIC $$\sigma_a$$ and $$\sigma_b$$ quantify between-species heterogeneity.
+# MAGIC
+# MAGIC This allows well-supported species to retain distinctive relationships while
+# MAGIC more uncertain species can borrow statistical information from the overall
+# MAGIC population.
+# MAGIC
+# MAGIC A non-centered parameterization is used for efficient Bayesian sampling.
+
+# COMMAND ----------
+
+# ============================================================
+# Hierarchical partial-pooling data
+# ============================================================
+
+hierarchical_data = {
+    "N": len(df),
+    "J": J,
+    "x": df["isotope_diff"].to_numpy(),
+    "temperature": df["temperature"].to_numpy(),
+    "species_id": df["species_id"].to_numpy(),
+}
+
+print(f"N = {hierarchical_data['N']}")
+print(f"J = {hierarchical_data['J']}")
+
+# COMMAND ----------
+
+# ============================================================
+# Compile hierarchical model
+# ============================================================
+
+HIERARCHICAL_STAN = os.path.abspath(
+    "../stan/hierarchical_model.stan"
+)
+
+hierarchical_model = CmdStanModel(
+    stan_file=HIERARCHICAL_STAN
+)
+
+print("✓ Hierarchical model compiled successfully")
+
+# COMMAND ----------
+
+# ============================================================
+# Fit hierarchical model
+# ============================================================
+
+hierarchical_fit = hierarchical_model.sample(
+    data=hierarchical_data,
+    chains=4,
+    parallel_chains=4,
+    iter_warmup=1000,
+    iter_sampling=1000,
+    seed=SEED,
+    show_progress=True,
+)
+
+print("✓ Sampling completed")
+
+# COMMAND ----------
+
+print(hierarchical_fit.diagnose())
+
+# COMMAND ----------
+
+# ============================================================
+# Hierarchical population-level parameters
+# ============================================================
+
+summary_h = hierarchical_fit.summary()
+
+population_summary = summary_h.loc[
+    [
+        "a",
+        "b",
+        "sigma_a",
+        "sigma_b",
+        "sigma_T",
+    ],
+    [
+        "Mean",
+        "StdDev",
+        "5%",
+        "50%",
+        "95%",
+        "ESS_bulk",
+        "R_hat",
+    ],
+]
+
+display(population_summary.round(4))
+
+# COMMAND ----------
+
+# ============================================================
+# Hierarchical species-specific estimates
+# ============================================================
+
+a_j_draws = hierarchical_fit.stan_variable("a_j")
+b_j_draws = hierarchical_fit.stan_variable("b_j")
+
+hierarchical_species_summary = pd.DataFrame({
+    "Species": species_names,
+
+    "Intercept mean": np.mean(
+        a_j_draws,
+        axis=0
+    ),
+
+    "Intercept SD": np.std(
+        a_j_draws,
+        axis=0
+    ),
+
+    "Slope mean": np.mean(
+        b_j_draws,
+        axis=0
+    ),
+
+    "Slope SD": np.std(
+        b_j_draws,
+        axis=0
+    ),
+})
+
+hierarchical_species_summary = (
+    hierarchical_species_summary.round(3)
+)
+
+display(hierarchical_species_summary)
+
+# COMMAND ----------
+
+sigma_hierarchical = (
+    hierarchical_fit
+    .stan_variable("sigma_T")
+    .mean()
+)
+
+print(
+    f"Complete pooling : "
+    f"{complete_pooling_fit.stan_variable('sigma_T').mean():.3f} °C"
+)
+
+print(
+    f"No pooling       : "
+    f"{species_fit.stan_variable('sigma_T').mean():.3f} °C"
+)
+
+print(
+    f"Partial pooling  : "
+    f"{sigma_hierarchical:.3f} °C"
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Partial pooling and species-level shrinkage
+# MAGIC
+# MAGIC The hierarchical model achieves almost the same residual fit as the
+# MAGIC fully species-specific model while sharing information across species.
+# MAGIC
+# MAGIC Partial pooling has the greatest influence on species whose independent
+# MAGIC parameter estimates are uncertain. Well-supported species remain close
+# MAGIC to their no-pooling estimates, while uncertain estimates are pulled
+# MAGIC toward the population-level relationship.
+# MAGIC
+# MAGIC The following figure compares the species-specific intercepts and slopes
+# MAGIC estimated by the no-pooling and hierarchical models.
+
+# COMMAND ----------
+
+# ============================================================
+# Visualising hierarchical shrinkage
+# ============================================================
+
+# Sample sizes
+species_counts = (
+    df.groupby("species")
+    .size()
+    .reindex(species_names)
+)
+
+# No-pooling posterior summaries
+no_pool_a_mean = np.mean(a_draws_species, axis=0)
+no_pool_a_sd = np.std(a_draws_species, axis=0)
+
+no_pool_b_mean = np.mean(b_draws_species, axis=0)
+no_pool_b_sd = np.std(b_draws_species, axis=0)
+
+# Partial-pooling posterior summaries
+partial_a_mean = np.mean(a_j_draws, axis=0)
+partial_a_sd = np.std(a_j_draws, axis=0)
+
+partial_b_mean = np.mean(b_j_draws, axis=0)
+partial_b_sd = np.std(b_j_draws, axis=0)
+
+# Population-level means
+population_a = hierarchical_fit.stan_variable("a").mean()
+population_b = hierarchical_fit.stan_variable("b").mean()
+
+# Order species by sample size
+order = np.argsort(species_counts.values)
+
+ordered_species = np.array(species_names)[order]
+ordered_counts = species_counts.values[order]
+
+y = np.arange(J)
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(
+    1,
+    2,
+    figsize=(15, 7),
+    sharey=True
+)
+
+# ==========================
+# A. Intercepts
+# ==========================
+
+axes[0].errorbar(
+    no_pool_a_mean[order],
+    y + 0.12,
+    xerr=no_pool_a_sd[order],
+    fmt="o",
+    capsize=3,
+    label="No pooling"
+)
+
+axes[0].errorbar(
+    partial_a_mean[order],
+    y - 0.12,
+    xerr=partial_a_sd[order],
+    fmt="o",
+    capsize=3,
+    label="Partial pooling"
+)
+
+# Connect estimates to show shrinkage
+for i, idx in enumerate(order):
+    axes[0].plot(
+        [
+            no_pool_a_mean[idx],
+            partial_a_mean[idx]
+        ],
+        [
+            y[i] + 0.12,
+            y[i] - 0.12
+        ],
+        alpha=0.35
+    )
+
+axes[0].axvline(
+    population_a,
+    linestyle="--",
+    linewidth=1.5,
+    label="Population mean"
+)
+
+axes[0].set_xlabel("Species intercept $a_j$ (°C)")
+axes[0].set_title("A. Intercept shrinkage")
+axes[0].grid(axis="x", alpha=0.2)
+
+# ==========================
+# B. Slopes
+# ==========================
+
+axes[1].errorbar(
+    no_pool_b_mean[order],
+    y + 0.12,
+    xerr=no_pool_b_sd[order],
+    fmt="o",
+    capsize=3,
+    label="No pooling"
+)
+
+axes[1].errorbar(
+    partial_b_mean[order],
+    y - 0.12,
+    xerr=partial_b_sd[order],
+    fmt="o",
+    capsize=3,
+    label="Partial pooling"
+)
+
+for i, idx in enumerate(order):
+    axes[1].plot(
+        [
+            no_pool_b_mean[idx],
+            partial_b_mean[idx]
+        ],
+        [
+            y[i] + 0.12,
+            y[i] - 0.12
+        ],
+        alpha=0.35
+    )
+
+axes[1].axvline(
+    population_b,
+    linestyle="--",
+    linewidth=1.5,
+    label="Population mean"
+)
+
+axes[1].set_xlabel(
+    r"Species slope $b_j$ (°C per unit $\Delta^{18}O$)"
+)
+
+axes[1].set_title("B. Slope shrinkage")
+axes[1].grid(axis="x", alpha=0.2)
+
+# ==========================
+# Species labels + N
+# ==========================
+
+species_labels = [
+    f"{species}  (n={n})"
+    for species, n
+    in zip(ordered_species, ordered_counts)
+]
+
+axes[0].set_yticks(y)
+axes[0].set_yticklabels(species_labels)
+
+axes[0].legend()
+axes[1].legend()
+
+fig.suptitle(
+    "Hierarchical Partial Pooling Stabilizes Species-Level Estimates",
+    fontsize=15
+)
+
+fig.tight_layout()
+
+# Save
+FIGURES_DIR = os.path.abspath("../figures")
+
+figure_path = os.path.join(
+    FIGURES_DIR,
+    "partial_pooling_shrinkage.png"
+)
+
+fig.savefig(
+    figure_path,
+    dpi=180,
+    bbox_inches="tight"
+)
+
+print(f"Figure saved to:\n{figure_path}")
+
+plt.show()
