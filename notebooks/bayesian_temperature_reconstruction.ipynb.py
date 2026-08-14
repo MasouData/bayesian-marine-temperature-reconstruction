@@ -1417,3 +1417,374 @@ model_summary = pd.DataFrame({
 display(
     model_summary.round(2)
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Uncertainty-aware temperature reconstruction
+# MAGIC
+# MAGIC The hierarchical model can be used to reconstruct formation temperature
+# MAGIC from new oxygen-isotope measurements for a known species.
+# MAGIC
+# MAGIC For species \(j\), the expected temperature is
+# MAGIC
+# MAGIC $$T =a_j +b_j(\delta^{18}O_c-\delta^{18}O_w).$$
+# MAGIC
+# MAGIC Predictions incorporate three sources of uncertainty:
+# MAGIC
+# MAGIC 1. posterior uncertainty in the species-specific intercept \(a_j\);
+# MAGIC 2. posterior uncertainty in the species-specific slope \(b_j\);
+# MAGIC 3. residual temperature variation \(\sigma_T\).
+# MAGIC
+# MAGIC When measurement uncertainties for $$\delta^{18}O_c$$ and
+# MAGIC $$\delta^{18}O_w$$ are available, these are propagated through the
+# MAGIC reconstruction by sampling plausible isotope measurements before computing
+# MAGIC the corresponding posterior-predictive temperature.
+# MAGIC
+# MAGIC This produces a distribution of reconstructed temperatures rather than a
+# MAGIC single deterministic estimate.
+
+# COMMAND ----------
+
+# ============================================================
+# Posterior temperature reconstruction
+# ============================================================
+
+def reconstruct_temperature(
+    species,
+    d18_o_c,
+    d18_o_w,
+    d18_o_c_sd=None,
+    d18_o_w_sd=None,
+    seed=SEED,
+):
+    """
+    Reconstruct temperature using posterior draws from the
+    hierarchical partial-pooling model.
+
+    Parameters
+    ----------
+    species : str
+        Species name contained in species_to_id.
+
+    d18_o_c : array-like
+        Carbonate oxygen-isotope measurements.
+
+    d18_o_w : array-like
+        Seawater oxygen-isotope measurements.
+
+    d18_o_c_sd : array-like or None
+        Measurement uncertainty of d18_o_c.
+
+    d18_o_w_sd : array-like or None
+        Measurement uncertainty of d18_o_w.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Posterior median and 90% posterior-predictive intervals,
+        with and without isotope measurement uncertainty.
+    """
+
+    if species not in species_to_id:
+        raise ValueError(
+            f"Unknown species: {species}"
+        )
+
+    d18_o_c = np.atleast_1d(
+        np.asarray(d18_o_c, dtype=float)
+    )
+
+    d18_o_w = np.atleast_1d(
+        np.asarray(d18_o_w, dtype=float)
+    )
+
+    if d18_o_c.shape != d18_o_w.shape:
+        raise ValueError(
+            "d18_o_c and d18_o_w must have the same shape."
+        )
+
+    # Stan uses 1-based IDs, NumPy uses 0-based indexing
+    j = species_to_id[species] - 1
+
+    # Posterior draws
+    a_draws = hierarchical_fit.stan_variable("a_j")[:, j]
+    b_draws = hierarchical_fit.stan_variable("b_j")[:, j]
+    sigma_draws = hierarchical_fit.stan_variable("sigma_T")
+
+    n_draws = len(a_draws)
+    n_new = len(d18_o_c)
+
+    rng = np.random.default_rng(seed)
+
+    # ========================================================
+    # A. Prediction without measurement uncertainty
+    # ========================================================
+
+    isotope_diff = d18_o_c - d18_o_w
+
+    mu = (
+        a_draws[:, None]
+        + b_draws[:, None] * isotope_diff[None, :]
+    )
+
+    temperature_pred = rng.normal(
+        loc=mu,
+        scale=sigma_draws[:, None]
+    )
+
+    # ========================================================
+    # B. Prediction including measurement uncertainty
+    # ========================================================
+
+    if d18_o_c_sd is None:
+        d18_o_c_sd = np.zeros(n_new)
+
+    if d18_o_w_sd is None:
+        d18_o_w_sd = np.zeros(n_new)
+
+    d18_o_c_sd = np.broadcast_to(
+        np.asarray(d18_o_c_sd, dtype=float),
+        (n_new,)
+    )
+
+    d18_o_w_sd = np.broadcast_to(
+        np.asarray(d18_o_w_sd, dtype=float),
+        (n_new,)
+    )
+
+    if (d18_o_c_sd < 0).any() or (d18_o_w_sd < 0).any():
+        raise ValueError(
+            "Measurement uncertainties must be non-negative."
+        )
+
+    sampled_d18_o_c = rng.normal(
+        loc=d18_o_c[None, :],
+        scale=d18_o_c_sd[None, :],
+        size=(n_draws, n_new)
+    )
+
+    sampled_d18_o_w = rng.normal(
+        loc=d18_o_w[None, :],
+        scale=d18_o_w_sd[None, :],
+        size=(n_draws, n_new)
+    )
+
+    sampled_diff = (
+        sampled_d18_o_c
+        - sampled_d18_o_w
+    )
+
+    mu_measurement = (
+        a_draws[:, None]
+        + b_draws[:, None] * sampled_diff
+    )
+
+    temperature_pred_measurement = rng.normal(
+        loc=mu_measurement,
+        scale=sigma_draws[:, None]
+    )
+
+    # ========================================================
+    # Summaries
+    # ========================================================
+
+    result = pd.DataFrame({
+        "d18_O_c": d18_o_c,
+        "d18_O_w": d18_o_w,
+        "isotope_diff": isotope_diff,
+
+        "median_temperature":
+            np.median(temperature_pred, axis=0),
+
+        "lower_90":
+            np.quantile(
+                temperature_pred,
+                0.05,
+                axis=0
+            ),
+
+        "upper_90":
+            np.quantile(
+                temperature_pred,
+                0.95,
+                axis=0
+            ),
+
+        "median_with_measurement_uncertainty":
+            np.median(
+                temperature_pred_measurement,
+                axis=0
+            ),
+
+        "lower_90_with_measurement_uncertainty":
+            np.quantile(
+                temperature_pred_measurement,
+                0.05,
+                axis=0
+            ),
+
+        "upper_90_with_measurement_uncertainty":
+            np.quantile(
+                temperature_pred_measurement,
+                0.95,
+                axis=0
+            ),
+    })
+
+    return result
+
+# COMMAND ----------
+
+# ============================================================
+# Example reconstruction: Uvigerina flintii
+# ============================================================
+
+EXAMPLE_SPECIES = "Uvigerina flintii"
+
+example_data = df[
+    df["species"] == EXAMPLE_SPECIES
+].copy()
+
+# Prediction grid over the observed isotope range
+x_grid = np.linspace(
+    example_data["isotope_diff"].min(),
+    example_data["isotope_diff"].max(),
+    100
+)
+
+# Use a representative seawater isotope value
+d18_o_w_reference = (
+    example_data["d18_O_w"].median()
+)
+
+d18_o_c_grid = (
+    x_grid + d18_o_w_reference
+)
+
+# Representative measurement uncertainties
+d18_o_c_sd = (
+    example_data["d18_O_sd"].median()
+)
+
+d18_o_w_sd = (
+    example_data["d18_O_w_sd"].median()
+)
+
+print(f"Species: {EXAMPLE_SPECIES}")
+print(f"Observations: {len(example_data)}")
+print(f"Median d18_O uncertainty: {d18_o_c_sd:.3f}")
+print(f"Median d18_O_w uncertainty: {d18_o_w_sd:.3f}")
+
+reconstruction = reconstruct_temperature(
+    species=EXAMPLE_SPECIES,
+    d18_o_c=d18_o_c_grid,
+    d18_o_w=np.full_like(
+        d18_o_c_grid,
+        d18_o_w_reference
+    ),
+    d18_o_c_sd=d18_o_c_sd,
+    d18_o_w_sd=d18_o_w_sd,
+)
+
+display(
+    reconstruction.iloc[
+        np.linspace(
+            0,
+            len(reconstruction) - 1,
+            5,
+            dtype=int
+        )
+    ].round(2)
+)
+
+# COMMAND ----------
+
+# ============================================================
+# Temperature reconstruction visualization
+# ============================================================
+
+fig, ax = plt.subplots(
+    figsize=(10, 6)
+)
+
+# Observed data
+ax.scatter(
+    example_data["isotope_diff"],
+    example_data["temperature"],
+    s=55,
+    alpha=0.80,
+    label="Observed measurements"
+)
+
+# Posterior median
+ax.plot(
+    reconstruction["isotope_diff"],
+    reconstruction[
+        "median_temperature"
+    ],
+    linewidth=2.2,
+    label="Posterior median"
+)
+
+# Posterior predictive interval
+ax.fill_between(
+    reconstruction["isotope_diff"],
+    reconstruction["lower_90"],
+    reconstruction["upper_90"],
+    alpha=0.18,
+    label="90% predictive interval"
+)
+
+# Predictive interval including measurement uncertainty
+ax.fill_between(
+    reconstruction["isotope_diff"],
+    reconstruction[
+        "lower_90_with_measurement_uncertainty"
+    ],
+    reconstruction[
+        "upper_90_with_measurement_uncertainty"
+    ],
+    alpha=0.15,
+    label="90% interval + isotope measurement uncertainty"
+)
+
+ax.set_xlabel(
+    r"Isotope difference  "
+    r"$\delta^{18}O_c-\delta^{18}O_w$"
+)
+
+ax.set_ylabel(
+    "Reconstructed formation temperature (°C)"
+)
+
+ax.set_title(
+    f"Uncertainty-Aware Temperature Reconstruction\n"
+    f"{EXAMPLE_SPECIES}"
+)
+
+ax.grid(alpha=0.2)
+
+ax.legend()
+
+fig.tight_layout()
+
+# Save figure
+FIGURES_DIR = os.path.abspath("../figures")
+
+figure_path = os.path.join(
+    FIGURES_DIR,
+    "temperature_reconstruction_uncertainty.png"
+)
+
+fig.savefig(
+    figure_path,
+    dpi=180,
+    bbox_inches="tight"
+)
+
+print(
+    f"Figure saved to:\n{figure_path}"
+)
+
+plt.show()
